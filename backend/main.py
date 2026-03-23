@@ -355,6 +355,96 @@ async def chat_simple(request: ChatRequestSimple, x_api_key: Optional[str] = Hea
         raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
 
 
+# ============ FILE ANALYSIS CHAT ENDPOINT ============
+
+class FileData(BaseModel):
+    name: str = Field(..., description="File name")
+    type: str = Field(..., description="File MIME type")
+    content: str = Field(..., description="File content as base64 string")
+
+class ChatWithFilesRequest(BaseModel):
+    message: str = Field(..., description="User message")
+    files: List[FileData] = Field(default=[], description="List of files to analyze")
+    chatId: Optional[str] = None
+    userId: str = Field(..., description="User ID")
+
+@app.post("/api/v1/chat/analyze-file")
+async def chat_with_files(request: ChatWithFilesRequest, x_api_key: Optional[str] = Header(None)):
+    """Chat endpoint with file analysis - extracts text from files and includes in chat context"""
+    from backend.file_processors import process_multiple_files
+
+    verify_api_key(x_api_key)
+
+    if not request.message or not request.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    # Process files if provided
+    file_texts = ""
+    if request.files:
+        try:
+            processed_files = process_multiple_files([f.dict() for f in request.files])
+            for pf in processed_files:
+                if 'error' in pf:
+                    file_texts += f"\n[Error processing file '{pf['name']}': {pf['error']}]\n"
+                else:
+                    file_texts += f"\n--- File: {pf['name']} ({pf['type']}, {pf['size']} bytes) ---\n"
+                    file_texts += pf['text']
+                    file_texts += "\n--- End of file ---\n"
+        except Exception as e:
+            logger.error(f"Error processing files: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to process files: {str(e)}")
+
+    # Build message array for LLM
+    system_content = f"""You are an AI assistant that can analyze documents. The user has provided files along with their message. Analyze the file content carefully and provide helpful insights.
+
+{file_texts}
+
+Focus on:
+- Key information in the documents
+- Data patterns, trends, or insights
+- Actionable recommendations
+- Answers to the user's specific questions
+
+If you find data in the files, reference it clearly in your response."""
+
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": request.message.strip()}
+    ]
+
+    try:
+        result = await chat_with_failover(
+            messages=messages,
+            max_tokens=8192,
+            temperature=0.7
+        )
+
+        return {
+            "id": result["id"],
+            "object": "chat.completion",
+            "created": int(datetime.utcnow().timestamp()),
+            "model": result["model"],
+            "response": result["content"],
+            "message": result["content"],
+            "files_processed": len(request.files),
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": result["content"]
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": result["usage"]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Chat with files error: {e}")
+        raise HTTPException(status_code=500, detail=f"Chat with files error: {str(e)}")
+
+
 # ============ STRUCTURED CHAT ENDPOINT (OpenAI-compatible) ============
 
 @app.post("/api/v1/chat/completions")
