@@ -1,0 +1,19 @@
+name: Trigger Railway Deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Railway Deploy
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          PROJECT_ID: b266c7d4-1a23-4f3a-964b-d3babcde57f0
+          SERVICE_ID: 0f972c57-0696-4cd5-a80f-f5ea3b48a39d
+        run: |
+          curl -X POST "https://backboard.railway.app/v2/projects/${PROJECT_ID}/services/${SERVICE_ID}/deployments" \
+            -H "Authorization: Bearer ${RAILWAY_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{}'
