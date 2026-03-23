@@ -20,6 +20,9 @@ aiohttp==3.9.1
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 
+# AI / LLM
+anthropic==0.39.0
+
 # Utilities
 python-dotenv==1.0.0
 pydantic-settings==2.1.0
