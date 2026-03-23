@@ -1,0 +1,13 @@
+# Supabase Edge Functions Configuration
+# This file configures the Edge Functions for the Hermes Topic Threader project
+
+[project]
+name = "hermes-topic-threader"
+
+[functions.chat-deepseek]
+verify_jwt = false  # Set to true in production for stricter auth
+import_map = "./import_map.json"
+
+[functions.process-topic]
+verify_jwt = false  # Set to true in production
+import_map = "./import_map.json"
