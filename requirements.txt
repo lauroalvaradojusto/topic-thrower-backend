@@ -8,12 +8,11 @@ python-multipart==0.0.6
 redis==5.0.1
 rq==1.15.1
 
-# Supabase
+# Supabase (postgrest-py is included as dependency)
 supabase==2.3.4
-postgrest-py==0.10.3
 
-# HTTP client
-httpx==0.25.2
+# HTTP client (version compatible with supabase)
+httpx>=0.24,<0.26
 aiohttp==3.9.1
 
 # JWT
