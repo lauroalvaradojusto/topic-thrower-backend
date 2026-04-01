@@ -17,6 +17,8 @@ import httpx
 import uuid
 import asyncio
 
+from lancedb_memory import LanceDBMemory, LanceDBUnavailableError
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -59,6 +61,44 @@ queue_high = Queue("high", connection=redis_conn) if redis_conn else None
 queue_default = Queue("default", connection=redis_conn) if redis_conn else None
 queue_low = Queue("low", connection=redis_conn) if redis_conn else None
 
+# LanceDB memory (mandatory lookup before responses)
+lancedb_memory = LanceDBMemory(required=True)
+
+
+def get_lancedb_system_context(user_query: str) -> Dict[str, Any]:
+    try:
+        return lancedb_memory.query_context(user_query, top_k=5)
+    except LanceDBUnavailableError as e:
+        raise HTTPException(status_code=503, detail=f"LanceDB unavailable: {str(e)}")
+
+
+def compose_system_with_lancedb(user_query: str, existing_system: Optional[str] = None) -> str:
+    lookup = get_lancedb_system_context(user_query)
+    memory_block = (
+        "[LANCEDB_CONTEXT]\n"
+        f"Instance: {lookup['instance_name']}\n"
+        f"Table: {lookup['table']}\n"
+        f"Hits: {lookup['hits']}\n"
+        f"{lookup['context']}\n"
+        "[/LANCEDB_CONTEXT]"
+    )
+
+    instruction = (
+        "You must consult and use the LanceDB context above before answering. "
+        "If the context is insufficient, explicitly say what is missing."
+    )
+
+    if existing_system and existing_system.strip():
+        return f"{existing_system.strip()}\n\n{memory_block}\n\n{instruction}"
+    return f"{memory_block}\n\n{instruction}"
+
+
+def persist_interaction_to_lancedb(user_id: Optional[str], user_message: str, assistant_reply: str) -> None:
+    try:
+        lancedb_memory.save_interaction(user_id=user_id or "global", user_message=user_message, assistant_reply=assistant_reply)
+    except Exception as e:
+        logger.warning(f"LanceDB save failed: {e}")
+
 
 # ============ MODELS ============
 
@@ -66,6 +106,8 @@ class HealthResponse(BaseModel):
     status: str
     redis: bool
     supabase: bool
+    lancedb: bool
+    lancedb_instance: str
     workers: int = 0
     queue_depths: Dict[str, int] = {}
 
@@ -108,6 +150,18 @@ class ChatResponse(BaseModel):
     choices: List[Dict[str, Any]]
     usage: Dict[str, Any]  # Changed from Dict[str, int] to avoid validation error with nested dicts
     response: Optional[str] = None  # For simple format compatibility
+
+
+class MemorySaveRequest(BaseModel):
+    content: str = Field(..., description="Memory content to store")
+    user_id: Optional[str] = Field(default="global")
+    role: str = Field(default="memory")
+    source: str = Field(default="manual")
+
+
+class MemorySearchRequest(BaseModel):
+    query: str = Field(..., description="Query to search in LanceDB")
+    top_k: int = Field(default=5, ge=1, le=20)
 
 
 # ============ API KEY VALIDATION ============
@@ -282,10 +336,14 @@ async def health():
             except:
                 queue_depths[queue_name] = 0
     
+    lancedb_status = lancedb_memory.status()
+
     return HealthResponse(
-        status="healthy" if redis_healthy else "degraded",
+        status="healthy" if redis_healthy and lancedb_status.ready else "degraded",
         redis=redis_healthy,
         supabase=supabase_healthy,
+        lancedb=lancedb_status.ready,
+        lancedb_instance=lancedb_status.instance_name,
         workers=workers,
         queue_depths=queue_depths
     )
@@ -293,6 +351,8 @@ async def health():
 
 @app.get("/")
 async def root():
+    lancedb_status = lancedb_memory.status()
+
     return {
         "service": "Hermes Backend API",
         "version": "2.0.0",
@@ -301,7 +361,66 @@ async def root():
             "anthropic": bool(ANTHROPIC_API_KEY),
             "deepseek": bool(DEEPSEEK_API_KEY)
         },
+        "lancedb": {
+            "ready": lancedb_status.ready,
+            "instance": lancedb_status.instance_name,
+            "table": lancedb_status.table,
+            "uri": lancedb_status.uri,
+        },
         "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@app.post("/api/v1/memory/save")
+async def memory_save(request: MemorySaveRequest, x_api_key: Optional[str] = Header(None)):
+    """Store manual content into LanceDB memory."""
+    verify_api_key(x_api_key)
+
+    if not request.content.strip():
+        raise HTTPException(status_code=400, detail="content cannot be empty")
+
+    try:
+        lancedb_memory.save_entry(
+            content=request.content.strip(),
+            role=request.role,
+            user_id=request.user_id or "global",
+            source=request.source,
+        )
+    except LanceDBUnavailableError as e:
+        raise HTTPException(status_code=503, detail=f"LanceDB unavailable: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LanceDB save failed: {str(e)}")
+
+    status = lancedb_memory.status()
+    return {
+        "ok": True,
+        "stored": True,
+        "instance": status.instance_name,
+        "table": status.table,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.post("/api/v1/memory/search")
+async def memory_search(request: MemorySearchRequest, x_api_key: Optional[str] = Header(None)):
+    """Search LanceDB memory directly."""
+    verify_api_key(x_api_key)
+
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="query cannot be empty")
+
+    try:
+        lookup = lancedb_memory.query_context(request.query.strip(), top_k=request.top_k)
+    except LanceDBUnavailableError as e:
+        raise HTTPException(status_code=503, detail=f"LanceDB unavailable: {str(e)}")
+
+    return {
+        "ok": True,
+        "instance": lookup["instance_name"],
+        "table": lookup["table"],
+        "hits": lookup["hits"],
+        "context": lookup["context"],
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
 
@@ -320,16 +439,24 @@ async def chat_simple(request: ChatRequestSimple, x_api_key: Optional[str] = Hea
     
     created = int(datetime.utcnow().timestamp())
     
+    user_message = request.message.strip()
+
+    # Mandatory LanceDB consult before response
+    system_content = compose_system_with_lancedb(user_message)
+
     # Build message array for LLM
-    messages = [{"role": "user", "content": request.message.strip()}]
+    messages = [{"role": "user", "content": user_message}]
     
     try:
         result = await chat_with_failover(
             messages=messages,
+            system_content=system_content,
             max_tokens=4096,
             temperature=0.7
         )
-        
+
+        persist_interaction_to_lancedb(request.userId, user_message, result["content"])
+
         return {
             "id": result["id"],
             "object": "chat.completion",
@@ -396,8 +523,10 @@ async def chat_with_files(request: ChatWithFilesRequest, x_api_key: Optional[str
             logger.error(f"Error processing files: {e}")
             raise HTTPException(status_code=400, detail=f"Failed to process files: {str(e)}")
 
+    user_message = request.message.strip() if request.message and request.message.strip() else "Please analyze the attached file(s)."
+
     # Build message array for LLM
-    system_content = f"""You are an AI assistant that can analyze documents. The user has provided files along with their message. Analyze the file content carefully and provide helpful insights.
+    base_system_content = f"""You are an AI assistant that can analyze documents. The user has provided files along with their message. Analyze the file content carefully and provide helpful insights.
 
 {file_texts}
 
@@ -409,17 +538,21 @@ Focus on:
 
 If you find data in the files, reference it clearly in your response."""
 
+    system_content = compose_system_with_lancedb(user_message, existing_system=base_system_content)
+
     messages = [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": request.message.strip() if request.message and request.message.strip() else "Please analyze the attached file(s)."}
+        {"role": "user", "content": user_message}
     ]
 
     try:
         result = await chat_with_failover(
             messages=messages,
-            max_tokens=8192,
+            system_content=system_content,
+            max_tokens=4096,
             temperature=0.7
         )
+
+        persist_interaction_to_lancedb(request.userId, user_message, result["content"])
 
         return {
             "id": result["id"],
@@ -470,6 +603,9 @@ async def chat_structured(request: ChatRequestStructured, x_api_key: Optional[st
     
     if not messages:
         raise HTTPException(status_code=400, detail="At least one user/assistant message required")
+
+    latest_user_message = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+    system_content = compose_system_with_lancedb(latest_user_message, existing_system=system_content)
     
     try:
         result = await chat_with_failover(
@@ -478,6 +614,8 @@ async def chat_structured(request: ChatRequestStructured, x_api_key: Optional[st
             max_tokens=request.max_tokens,
             temperature=request.temperature
         )
+
+        persist_interaction_to_lancedb(request.user_id, latest_user_message, result["content"])
         
         return {
             "id": result["id"],
@@ -514,7 +652,9 @@ async def chat_stream(request: ChatRequestSimple, x_api_key: Optional[str] = Hea
     if not request.message or not request.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
     
-    messages = [{"role": "user", "content": request.message.strip()}]
+    user_message = request.message.strip()
+    system_content = compose_system_with_lancedb(user_message)
+    messages = [{"role": "user", "content": user_message}]
     
     async def generate_stream():
         # Try Anthropic first
@@ -523,6 +663,7 @@ async def chat_stream(request: ChatRequestSimple, x_api_key: Optional[str] = Hea
                 payload = {
                     "model": "claude-sonnet-4-20250514",
                     "max_tokens": 4096,
+                    "system": system_content,
                     "messages": messages,
                     "stream": True
                 }
@@ -546,7 +687,7 @@ async def chat_stream(request: ChatRequestSimple, x_api_key: Optional[str] = Hea
                 payload = {
                     "model": "deepseek-chat",
                     "max_tokens": 4096,
-                    "messages": messages,
+                    "messages": [{"role": "system", "content": system_content}] + messages,
                     "stream": True
                 }
                 headers = {
