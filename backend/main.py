@@ -376,7 +376,8 @@ async def chat_with_files(request: ChatWithFilesRequest, x_api_key: Optional[str
     verify_api_key(x_api_key)
 
     if not request.message or not request.message.strip():
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
+        if not request.files or len(request.files) == 0:
+            raise HTTPException(status_code=400, detail="Message cannot be empty")
 
     # Process files if provided
     file_texts = ""
@@ -409,7 +410,7 @@ If you find data in the files, reference it clearly in your response."""
 
     messages = [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": request.message.strip()}
+        {"role": "user", "content": request.message.strip() if request.message and request.message.strip() else "Please analyze the attached file(s)."}
     ]
 
     try:
