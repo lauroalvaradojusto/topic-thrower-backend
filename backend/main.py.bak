@@ -295,13 +295,14 @@ async def health():
 async def root():
     return {
         "service": "Hermes Backend API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "running",
         "providers": {
             "anthropic": bool(ANTHROPIC_API_KEY),
             "deepseek": bool(DEEPSEEK_API_KEY)
         },
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.utcnow().isoformat(),
+        "file_upload": "enabled"
     }
 
 
@@ -376,7 +377,7 @@ async def chat_with_files(request: ChatWithFilesRequest, x_api_key: Optional[str
     verify_api_key(x_api_key)
 
     if not request.message or not request.message.strip():
-        if not request.files or len(request.files) == 0:
+        if not request.files:
             raise HTTPException(status_code=400, detail="Message or files are required")
         request.message = "Please analyze the attached file(s)."
 
@@ -411,7 +412,7 @@ If you find data in the files, reference it clearly in your response."""
 
     messages = [
         {"role": "system", "content": system_content},
-        {"role": "user", "content": request.message.strip() if request.message and request.message.strip() else "Please analyze the attached file(s)."}
+        {"role": "user", "content": request.message.strip()}
     ]
 
     try:

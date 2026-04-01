@@ -377,7 +377,8 @@ async def chat_with_files(request: ChatWithFilesRequest, x_api_key: Optional[str
 
     if not request.message or not request.message.strip():
         if not request.files or len(request.files) == 0:
-            raise HTTPException(status_code=400, detail="Message cannot be empty")
+            raise HTTPException(status_code=400, detail="Message or files are required")
+        request.message = "Please analyze the attached file(s)."
 
     # Process files if provided
     file_texts = ""
