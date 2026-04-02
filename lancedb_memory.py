@@ -146,7 +146,7 @@ class LanceDBMemory:
             except Exception as e:
                 raise LanceDBUnavailableError(f"LanceDB query failed: {e}")
 
-        usable = [r for r in rows if str(r.get("role", "")) != "seed"]
+        usable = [r for r in rows if self._is_usable_row(r)]
         snippets: List[str] = []
         for i, row in enumerate(usable[:top_k], 1):
             # Use up to 1500 chars for SCJN tesis (they contain full legal text)
@@ -167,16 +167,35 @@ class LanceDBMemory:
             "table": self.table_name,
         }
 
+    def _find_by_registro(self, registro: str) -> List[Dict[str, Any]]:
+        """String-scan all rows for a specific registro number. Used when numeric registro detected in query."""
+        try:
+            all_rows = self._table.to_pandas().to_dict("records")
+            hits = []
+            for r in all_rows:
+                content = str(r.get("content", ""))
+                if f"Registro: {registro}" in content or f"ius={registro}" in content:
+                    hits.append(r)
+            return hits
+        except Exception:
+            return []
+
     def query_context_hybrid(self, query: str, top_k: int = 10) -> Dict[str, Any]:
         """Hybrid search: combines semantic search with a SCJN-prefixed search.
-        Used when the query is about tesis/jurisprudencia to ensure SCJN results surface.
-        Returns merged results: top-k/2 from general + top-k/2 from SCJN-prefixed search.
+        Also does exact string lookup when query contains a 6-8 digit registro number.
         """
+        import re
         self._ensure_ready()
         if self._table is None:
             raise LanceDBUnavailableError(self._init_error or "LanceDB table unavailable")
 
         half = max(top_k // 2, 3)
+
+        # Pass 0: if query has a 6-8 digit number, do exact registro lookup first
+        registro_hits: List[Dict[str, Any]] = []
+        m = re.search(r'\b(\d{6,8})\b', query)
+        if m:
+            registro_hits = self._find_by_registro(m.group(1))
 
         # Pass 1: semantic search on original query
         general = self._raw_search(query, limit=top_k)
@@ -199,20 +218,26 @@ class LanceDBMemory:
         def add_rows(rows, limit):
             for r in rows:
                 key = str(r.get("content", ""))[:80]
-                if key not in seen_ids and len(merged) < limit + len(merged):
+                if key not in seen_ids:
                     seen_ids.add(key)
                     merged.append(r)
+                    if len(merged) >= limit:
+                        break
+
+        # Always inject exact registro hits at the top
+        if registro_hits:
+            add_rows(registro_hits, len(registro_hits))
 
         # Prioritize SCJN results up to half quota
         scjn_combined = general_scjn + [r for r in scjn_extra if r not in general_scjn]
-        add_rows(scjn_combined[:half], half)
+        add_rows(scjn_combined[:half], len(merged) + half)
         # Fill rest with non-SCJN
-        add_rows(general_other, top_k - len(merged))
+        add_rows(general_other, len(merged) + (top_k - len(merged)))
         # Top up with any remaining SCJN if slots available
         if len(merged) < top_k:
-            add_rows(scjn_combined, top_k - len(merged))
+            add_rows(scjn_combined, top_k)
 
-        usable = [r for r in merged[:top_k] if str(r.get("role", "")) != "seed"]
+        usable = [r for r in merged[:top_k] if self._is_usable_row(r)]
         snippets = []
         for i, row in enumerate(usable, 1):
             content = str(row.get("content", "")).strip()
@@ -227,6 +252,70 @@ class LanceDBMemory:
             "instance_name": self.instance_name,
             "table": self.table_name,
         }
+
+    def query_context_video_hybrid(self, query: str, top_k: int = 10) -> Dict[str, Any]:
+        """Hybrid for video-derived knowledge: prioritize YT_QA / YT_LEGAL blocks, then fill with general context."""
+        self._ensure_ready()
+        if self._table is None:
+            raise LanceDBUnavailableError(self._init_error or "LanceDB table unavailable")
+
+        half = max(top_k // 2, 3)
+        general = self._raw_search(query, limit=top_k * 2)
+        yt_rows = self._raw_search(f"YT_QA YT_LEGAL {query}", limit=top_k * 2)
+
+        def is_video_row(r: Dict[str, Any]) -> bool:
+            c = str(r.get("content", "")).strip()
+            return c.startswith("YT_QA") or c.startswith("YT_LEGAL") or c.startswith("YT_QA_PINNED") or c.startswith("YT_QA_INDEX")
+
+        video_candidates = [r for r in (yt_rows + general) if is_video_row(r) and self._is_usable_row(r)]
+        other_candidates = [r for r in general if (not is_video_row(r)) and self._is_usable_row(r)]
+
+        seen = set()
+        merged: List[Dict[str, Any]] = []
+
+        def push(rows: List[Dict[str, Any]], limit: int):
+            for r in rows:
+                key = str(r.get("content", ""))[:120]
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(r)
+                if len(merged) >= limit:
+                    break
+
+        push(video_candidates, half)
+        if len(merged) < top_k:
+            push(other_candidates, top_k)
+        if len(merged) < top_k:
+            push(video_candidates, top_k)
+
+        usable = merged[:top_k]
+        snippets: List[str] = []
+        for i, row in enumerate(usable, 1):
+            content = str(row.get("content", "")).strip()
+            max_chars = 900 if content.startswith("YT_") else (1500 if content.startswith("SCJN_PENAL_TESIS") else 600)
+            snippets.append(f"[{i}] {content[:max_chars]}")
+
+        context_block = "\n".join(snippets).strip() or "No prior memory found in LanceDB for this query."
+        return {
+            "context": context_block,
+            "hits": len(usable),
+            "instance_name": self.instance_name,
+            "table": self.table_name,
+        }
+
+    def _is_chat_history_noise(self, row: Dict[str, Any]) -> bool:
+        source = str(row.get("source", "")).lower().strip()
+        role = str(row.get("role", "")).lower().strip()
+        content = str(row.get("content", "")).strip()
+        if source == "chat" and role in {"user", "assistant"}:
+            return True
+        if content.startswith("User:") or content.startswith("Assistant:"):
+            return True
+        return False
+
+    def _is_usable_row(self, row: Dict[str, Any]) -> bool:
+        return str(row.get("role", "")) != "seed" and not self._is_chat_history_noise(row)
 
     def _raw_search(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Raw vector search, returns list of row dicts."""
