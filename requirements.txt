@@ -24,6 +24,8 @@ anthropic==0.39.0
 
 # Vector memory
 lancedb==0.8.2
+sentence-transformers==2.7.0
+torch==2.2.2
 
 # File processing dependencies
 PyPDF2==3.0.1

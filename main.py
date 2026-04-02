@@ -65,9 +65,32 @@ queue_low = Queue("low", connection=redis_conn) if redis_conn else None
 lancedb_memory = LanceDBMemory(required=True)
 
 
+_TESIS_TRIGGERS = {
+    "tesis", "jurisprudencia", "jurisprudencias", "semanario", "scjn", "sjf",
+    "ius", "criterio", "criterios", "precedente", "precedentes", "época", "epoca",
+    "sala", "pleno", "circuito", "colegiado", "colegiados", "aislada", "aisladas",
+}
+
+def _is_tesis_query(query: str) -> bool:
+    """Returns True if the query is likely asking about SCJN tesis/jurisprudencia."""
+    q = query.lower()
+    # Match explicit triggers
+    if any(t in q for t in _TESIS_TRIGGERS):
+        return True
+    # Match 7-digit IUS numbers (e.g. "2023521", "tesis 2031902")
+    import re
+    if re.search(r'\b\d{6,8}\b', q):
+        return True
+    return False
+
+
 def get_lancedb_system_context(user_query: str) -> Dict[str, Any]:
     try:
-        return lancedb_memory.query_context(user_query, top_k=5)
+        if _is_tesis_query(user_query):
+            # Hybrid search: ensures SCJN tesis surface even when CP PDFs dominate
+            return lancedb_memory.query_context_hybrid(user_query, top_k=10)
+        else:
+            return lancedb_memory.query_context(user_query, top_k=8)
     except LanceDBUnavailableError as e:
         raise HTTPException(status_code=503, detail=f"LanceDB unavailable: {str(e)}")
 
