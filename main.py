@@ -64,33 +64,83 @@ queue_low = Queue("low", connection=redis_conn) if redis_conn else None
 # LanceDB memory (mandatory lookup before responses)
 lancedb_memory = LanceDBMemory(required=True)
 
+# Auto-seed SCJN tesis on startup if not already present
+def _seed_scjn_tesis() -> None:
+    """Ingest SCJN tesis from bundled JSON into inference_memory if not already seeded."""
+    try:
+        seed_path = os.path.join(os.path.dirname(__file__), "scjn_tesis_seed.json")
+        if not os.path.exists(seed_path):
+            logger.warning("scjn_tesis_seed.json not found — skipping SCJN tesis seeding")
+            return
+
+        # Check if already seeded (look for SCJN_PENAL_TESIS rows)
+        try:
+            existing = lancedb_memory._raw_search("SCJN_PENAL_TESIS legítima defensa", limit=3)
+            scjn_rows = [r for r in existing if str(r.get("content", "")).startswith("SCJN_PENAL_TESIS")]
+            if scjn_rows:
+                logger.info(f"SCJN tesis already seeded ({len(scjn_rows)} found) — skipping")
+                return
+        except Exception:
+            pass
+
+        with open(seed_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+
+        ingested = 0
+        for rec in records:
+            content = rec.get("content", "").strip()
+            if not content:
+                continue
+            try:
+                lancedb_memory.save_entry(content=content, role="memory", user_id="scjn_seed", source="scjn_tesis")
+                ingested += 1
+            except Exception as e:
+                logger.warning(f"Failed to seed tesis: {e}")
+        logger.info(f"SCJN tesis seeded: {ingested}/{len(records)} records ingested")
+    except Exception as e:
+        logger.error(f"SCJN seed error: {e}")
+
+_seed_scjn_tesis()
+
 
 _TESIS_TRIGGERS = {
     "tesis", "jurisprudencia", "jurisprudencias", "semanario", "scjn", "sjf",
     "ius", "criterio", "criterios", "precedente", "precedentes", "época", "epoca",
     "sala", "pleno", "circuito", "colegiado", "colegiados", "aislada", "aisladas",
+    "registro", "sjf2", "suprema corte", "penal", "legítima defensa", "legitima defensa",
+}
+
+_VIDEO_LABOR_TRIGGERS = {
+    "despido", "injustificado", "trabajador", "patrón", "patron", "aviso", "notifica", "notificación", "notificacion",
+    "artículo 47", "articulo 47", "lft", "reinstalación", "reinstalacion", "indemnización", "indemnizacion",
+    "ponencia", "canal", "video", "youtube",
 }
 
 def _is_tesis_query(query: str) -> bool:
     """Returns True if the query is likely asking about SCJN tesis/jurisprudencia."""
     q = query.lower()
-    # Match explicit triggers
     if any(t in q for t in _TESIS_TRIGGERS):
         return True
-    # Match 7-digit IUS numbers (e.g. "2023521", "tesis 2031902")
     import re
     if re.search(r'\b\d{6,8}\b', q):
         return True
     return False
 
 
+def _is_video_labor_query(query: str) -> bool:
+    q = query.lower()
+    return any(t in q for t in _VIDEO_LABOR_TRIGGERS)
+
+
 def get_lancedb_system_context(user_query: str) -> Dict[str, Any]:
     try:
         if _is_tesis_query(user_query):
-            # Hybrid search: ensures SCJN tesis surface even when CP PDFs dominate
+            # Hybrid search: ensures SCJN tesis surface when query explicitly asks for tesis/jurisprudencia
             return lancedb_memory.query_context_hybrid(user_query, top_k=10)
-        else:
-            return lancedb_memory.query_context(user_query, top_k=8)
+        if _is_video_labor_query(user_query):
+            # Hybrid for labor/video-derived questions: prioritize YT_QA / YT_LEGAL blocks
+            return lancedb_memory.query_context_video_hybrid(user_query, top_k=10)
+        return lancedb_memory.query_context(user_query, top_k=8)
     except LanceDBUnavailableError as e:
         raise HTTPException(status_code=503, detail=f"LanceDB unavailable: {str(e)}")
 
@@ -108,7 +158,11 @@ def compose_system_with_lancedb(user_query: str, existing_system: Optional[str] 
 
     instruction = (
         "You must consult and use the LanceDB context above before answering. "
-        "If the context is insufficient, explicitly say what is missing."
+        "Respond as a final professional answer for end users. "
+        "Do NOT mention internal systems, retrieval process, embeddings, context blocks, 'LanceDB', or phrases like 'según el contexto proporcionado'. "
+        "Do NOT reveal that the answer came from a video/database unless the user explicitly asks for sources. "
+        "If the user insists on personalized legal-case detail, respond exactly with: 'consulta con tu abogado de confianza el te detallara con gusto el caso. y te dira poco mas o menos la misma respuesta que yo.' "
+        "If information is insufficient, keep the answer concise and user-facing without exposing internals."
     )
 
     if existing_system and existing_system.strip():
@@ -278,35 +332,50 @@ async def call_deepseek(messages: List[Dict], system_content: Optional[str] = No
         "Content-Type": "application/json"
     }
     
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        response = await client.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            json=payload,
-            headers=headers
-        )
-        
-        if response.status_code != 200:
-            raise Exception(f"DeepSeek API error {response.status_code}: {response.text[:500]}")
-        
-        data = response.json()
-        
-        content = ""
-        choices = data.get("choices", [])
-        if choices:
-            content = choices[0].get("message", {}).get("content", "")
-        
-        usage = data.get("usage", {})
-        
-        return {
-            "id": data.get("id", f"chatcmpl-{uuid.uuid4()}"),
-            "model": "deepseek-chat",
-            "content": content,
-            "usage": {
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(
+                    "https://api.deepseek.com/v1/chat/completions",
+                    json=payload,
+                    headers=headers
+                )
+
+            if response.status_code != 200:
+                # Retry transient server-side errors
+                if response.status_code >= 500 and attempt < 3:
+                    await asyncio.sleep(0.8 * attempt)
+                    continue
+                raise Exception(f"DeepSeek API error {response.status_code}: {response.text[:500]}")
+
+            data = response.json()
+
+            content = ""
+            choices = data.get("choices", [])
+            if choices:
+                content = choices[0].get("message", {}).get("content", "")
+
+            usage = data.get("usage", {})
+
+            return {
+                "id": data.get("id", f"chatcmpl-{uuid.uuid4()}"),
+                "model": "deepseek-chat",
+                "content": content,
+                "usage": {
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                }
             }
-        }
+        except Exception as e:
+            last_error = e
+            if attempt < 3:
+                await asyncio.sleep(0.8 * attempt)
+                continue
+            break
+
+    raise Exception(f"DeepSeek failed after retries: {last_error}")
 
 
 async def chat_with_failover(messages: List[Dict], system_content: Optional[str] = None,
