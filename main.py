@@ -100,7 +100,11 @@ def _seed_scjn_tesis() -> None:
     except Exception as e:
         logger.error(f"SCJN seed error: {e}")
 
-_seed_scjn_tesis()
+@app.on_event("startup")
+async def startup_seed_scjn():
+    """Run SCJN tesis seeding in background so it doesn't block health checks."""
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _seed_scjn_tesis)
 
 
 _TESIS_TRIGGERS = {
