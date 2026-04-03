@@ -191,11 +191,14 @@ class LanceDBMemory:
 
         half = max(top_k // 2, 3)
 
-        # Pass 0: if query has a 6-8 digit number, do exact registro lookup first
+        # Pass 0: find ALL 6-8 digit numbers in query and do exact registro lookup for each
         registro_hits: List[Dict[str, Any]] = []
-        m = re.search(r'\b(\d{6,8})\b', query)
-        if m:
-            registro_hits = self._find_by_registro(m.group(1))
+        all_nums = re.findall(r'\b(\d{6,8})\b', query)
+        seen_registro = set()
+        for num in all_nums:
+            if num not in seen_registro:
+                seen_registro.add(num)
+                registro_hits.extend(self._find_by_registro(num))
 
         # Pass 1: semantic search on original query
         general = self._raw_search(query, limit=top_k)

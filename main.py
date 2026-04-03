@@ -136,15 +136,29 @@ def _is_video_labor_query(query: str) -> bool:
     return any(t in q for t in _VIDEO_LABOR_TRIGGERS)
 
 
+def _extract_user_query(raw_message: str) -> str:
+    """Strip injected system prompts (e.g. LEGAL_MODE) to get the real user query for LanceDB search."""
+    import re
+    # Frontend may prepend [LEGAL_MODE - ACTIVE]...[/LEGAL_MODE]\n\nConsulta del usuario: <real query>
+    m = re.search(r'Consulta del usuario:\s*(.+)', raw_message, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Also handle [WEB_SEARCH_CONTEXT] blocks appended by frontend
+    cleaned = re.sub(r'\[WEB_SEARCH_CONTEXT\].*?\[/WEB_SEARCH_CONTEXT\]', '', raw_message, flags=re.DOTALL)
+    return cleaned.strip() or raw_message
+
+
 def get_lancedb_system_context(user_query: str) -> Dict[str, Any]:
+    # Extract the real user query, stripping any injected prompts from the frontend
+    search_query = _extract_user_query(user_query)
     try:
-        if _is_tesis_query(user_query):
+        if _is_tesis_query(search_query):
             # Hybrid search: ensures SCJN tesis surface when query explicitly asks for tesis/jurisprudencia
-            return lancedb_memory.query_context_hybrid(user_query, top_k=10)
-        if _is_video_labor_query(user_query):
+            return lancedb_memory.query_context_hybrid(search_query, top_k=10)
+        if _is_video_labor_query(search_query):
             # Hybrid for labor/video-derived questions: prioritize YT_QA / YT_LEGAL blocks
-            return lancedb_memory.query_context_video_hybrid(user_query, top_k=10)
-        return lancedb_memory.query_context(user_query, top_k=8)
+            return lancedb_memory.query_context_video_hybrid(search_query, top_k=10)
+        return lancedb_memory.query_context(search_query, top_k=8)
     except LanceDBUnavailableError as e:
         raise HTTPException(status_code=503, detail=f"LanceDB unavailable: {str(e)}")
 
